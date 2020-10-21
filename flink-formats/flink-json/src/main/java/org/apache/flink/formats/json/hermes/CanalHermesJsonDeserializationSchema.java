@@ -16,11 +16,15 @@
  * limitations under the License.
  */
 
-package org.apache.flink.formats.json.canal;
+package org.apache.flink.formats.json.hermes;
 
+import static java.lang.String.format;
+
+import java.io.IOException;
+import java.util.Objects;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.formats.json.JsonRowDataDeserializationSchema;
+import org.apache.flink.formats.json.HermesJsonRowDataDeserializationSchema;
 import org.apache.flink.formats.json.TimestampFormat;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.data.ArrayData;
@@ -30,12 +34,6 @@ import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.types.RowKind;
 import org.apache.flink.util.Collector;
-
-import java.io.IOException;
-import java.util.Objects;
-
-import static java.lang.String.format;
-import static org.apache.flink.table.types.utils.TypeConversions.fromLogicalToDataType;
 
 /**
  * Deserialization schema from Canal JSON to Flink Table/SQL internal data structure {@link
@@ -49,7 +47,7 @@ import static org.apache.flink.table.types.utils.TypeConversions.fromLogicalToDa
  *
  * @see <a href="https://github.com/alibaba/canal">Alibaba Canal</a>
  */
-public final class CanalJsonDeserializationSchema implements DeserializationSchema<RowData> {
+public final class CanalHermesJsonDeserializationSchema implements DeserializationSchema<RowData> {
 
 	private static final long serialVersionUID = 1L;
 
@@ -60,7 +58,7 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
 	/**
 	 * The deserializer to deserialize Debezium JSON data.
 	 */
-	private final JsonRowDataDeserializationSchema jsonDeserializer;
+	private final HermesJsonRowDataDeserializationSchema jsonDeserializer;
 
 	/**
 	 * TypeInformation of the produced {@link RowData}.
@@ -77,21 +75,26 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
 	 */
 	private final int fieldCount;
 
-	public CanalJsonDeserializationSchema(
+	public CanalHermesJsonDeserializationSchema(
 		RowType rowType,
 		TypeInformation<RowData> resultTypeInfo,
 		boolean ignoreParseErrors,
-		TimestampFormat timestampFormatOption) {
+		TimestampFormat timestampFormatOption,
+		String topic) {
+
 		this.resultTypeInfo = resultTypeInfo;
 		this.ignoreParseErrors = ignoreParseErrors;
 		this.fieldCount = rowType.getFieldCount();
-		this.jsonDeserializer = new JsonRowDataDeserializationSchema(
-			createJsonRowType(fromLogicalToDataType(rowType)),
+
+		this.jsonDeserializer = new HermesJsonRowDataDeserializationSchema(
+			rowType,
+			createJsonRowType(),
 			// the result type is never used, so it's fine to pass in Canal's result type
 			resultTypeInfo,
 			false, // ignoreParseErrors already contains the functionality of failOnMissingField
 			ignoreParseErrors,
-			timestampFormatOption);
+			timestampFormatOption,
+			topic);
 
 	}
 
@@ -105,45 +108,35 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
 	public void deserialize(byte[] message, Collector<RowData> out) throws IOException {
 		try {
 			RowData row = jsonDeserializer.deserialize(message);
-			String type = row.getString(2).toString(); // "type" field
+			// "eventType" field
+			String type = row.getString(2).toString();
 			if (OP_INSERT.equals(type)) {
-				// "data" field is an array of row, contains inserted rows
-				ArrayData data = row.getArray(0);
-				for (int i = 0; i < data.size(); i++) {
-					RowData insert = data.getRow(i, fieldCount);
-					insert.setRowKind(RowKind.INSERT);
-					out.collect(insert);
-				}
+				// "afterColumnList" field is an array of column,combine all as insert row
+				RowData insert = row.getRow(0, fieldCount);
+				insert.setRowKind(RowKind.INSERT);
+				out.collect(insert);
 			} else if (OP_UPDATE.equals(type)) {
-				// "data" field is an array of row, contains new rows
-				ArrayData data = row.getArray(0);
-				// "old" field is an array of row, contains old values
-				ArrayData old = row.getArray(1);
-				for (int i = 0; i < data.size(); i++) {
-					// the underlying JSON deserialization schema always produce GenericRowData.
-					GenericRowData after = (GenericRowData) data.getRow(i, fieldCount);
-					GenericRowData before = (GenericRowData) old.getRow(i, fieldCount);
-					for (int f = 0; f < fieldCount; f++) {
-						if (before.isNullAt(f)) {
-							// not null fields in "old" (before) means the fields are changed
-							// null/empty fields in "old" (before) means the fields are not changed
-							// so we just copy the not changed fields into before
-							before.setField(f, after.getField(f));
-						}
+				// "afterColumnList" field is an array of column,combine all as insert row, contains new rows
+				GenericRowData after = (GenericRowData) row.getRow(0, fieldCount);
+				// "beforeColumnList" field is an array of column,combine all as insert row, contains old values
+				GenericRowData before = (GenericRowData) row.getRow(1, fieldCount);
+				// the underlying JSON deserialization schema always produce GenericRowData.
+				for (int f = 0; f < fieldCount; f++) {
+					if (before.isNullAt(f)) {
+						// not null fields in "old" (before) means the fields are changed
+						// null/empty fields in "old" (before) means the fields are not changed
+						// so we just copy the not changed fields into before
+						before.setField(f, after.getField(f));
 					}
-					before.setRowKind(RowKind.UPDATE_BEFORE);
-					after.setRowKind(RowKind.UPDATE_AFTER);
-					out.collect(before);
-					out.collect(after);
 				}
+				before.setRowKind(RowKind.UPDATE_BEFORE);
+				after.setRowKind(RowKind.UPDATE_AFTER);
+				out.collect(before);
+				out.collect(after);
 			} else if (OP_DELETE.equals(type)) {
-				// "data" field is an array of row, contains deleted rows
-				ArrayData data = row.getArray(0);
-				for (int i = 0; i < data.size(); i++) {
-					RowData insert = data.getRow(i, fieldCount);
-					insert.setRowKind(RowKind.DELETE);
-					out.collect(insert);
-				}
+				GenericRowData before = (GenericRowData) row.getRow(1, fieldCount);
+				before.setRowKind(RowKind.DELETE);
+				out.collect(before);
 			} else {
 				if (!ignoreParseErrors) {
 					throw new IOException(format(
@@ -178,7 +171,7 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
 		if (o == null || getClass() != o.getClass()) {
 			return false;
 		}
-		CanalJsonDeserializationSchema that = (CanalJsonDeserializationSchema) o;
+		CanalHermesJsonDeserializationSchema that = (CanalHermesJsonDeserializationSchema) o;
 		return ignoreParseErrors == that.ignoreParseErrors &&
 			fieldCount == that.fieldCount &&
 			Objects.equals(jsonDeserializer, that.jsonDeserializer) &&
@@ -190,12 +183,15 @@ public final class CanalJsonDeserializationSchema implements DeserializationSche
 		return Objects.hash(jsonDeserializer, resultTypeInfo, ignoreParseErrors, fieldCount);
 	}
 
-	private static RowType createJsonRowType(DataType databaseSchema) {
-		// Canal JSON contains other information, e.g. "database", "ts"
-		// but we don't need them
+	private static RowType createJsonRowType() {
+		DataType oneColumnData = DataTypes.ROW(
+			DataTypes.FIELD("name", DataTypes.STRING()),
+			DataTypes.FIELD("value", DataTypes.STRING())
+		);
 		return (RowType) DataTypes.ROW(
-			DataTypes.FIELD("data", DataTypes.ARRAY(databaseSchema)),
-			DataTypes.FIELD("old", DataTypes.ARRAY(databaseSchema)),
-			DataTypes.FIELD("type", DataTypes.STRING())).getLogicalType();
+			DataTypes.FIELD("afterColumnList", DataTypes.ARRAY(oneColumnData)),
+			DataTypes.FIELD("beforeColumnList", DataTypes.ARRAY(oneColumnData)),
+			DataTypes.FIELD("eventType", DataTypes.STRING())
+		).getLogicalType();
 	}
 }
