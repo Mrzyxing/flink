@@ -143,13 +143,7 @@ public class HermesJsonRowDataDeserializationSchema implements DeserializationSc
 	@Override
 	public RowData deserialize(byte[] message) throws IOException {
 		try {
-			ByteBuf byteBuf = Unpooled.wrappedBuffer(message);
-			Magic.readAndCheckMagic(byteBuf);
-			byte versionByte = byteBuf.readByte();
-			MessageCodecVersion version = MessageCodecVersion.valueOf(versionByte);
-			BaseConsumerMessage msg = version.getHandler().decode(topic, byteBuf, String.class);
-			final String data = msg.getBody().toString();
-			final JsonNode root = objectMapper.readTree(data);
+			final JsonNode root = objectMapper.readTree(message);
 			return (RowData) runtimeConverter.convert(root);
 		} catch (Throwable t) {
 			if (ignoreParseErrors) {
